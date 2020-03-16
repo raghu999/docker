@@ -1,36 +1,40 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"runtime"
+	"time"
 
-	"golang.org/x/net/context"
-
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/api/types/versions/v1p20"
+	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/version"
-	"github.com/docker/engine-api/types"
-	"github.com/docker/engine-api/types/versions/v1p20"
 )
 
 // ContainerStats writes information about the container to the stream
 // given in the config object.
 func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, config *backend.ContainerStatsConfig) error {
-	if runtime.GOOS == "windows" {
-		return errors.New("Windows does not support stats")
+	// Engine API version (used for backwards compatibility)
+	apiVersion := config.Version
+
+	if isWindows && versions.LessThan(apiVersion, "1.21") {
+		return errors.New("API versions pre v1.21 do not support stats on Windows")
 	}
-	// Remote API version (used for backwards compatibility)
-	apiVersion := version.Version(config.Version)
 
 	container, err := daemon.GetContainer(prefixOrName)
 	if err != nil {
 		return err
 	}
 
-	// If the container is not running and requires no stream, return an empty stats.
-	if !container.IsRunning() && !config.Stream {
-		return json.NewEncoder(config.OutStream).Encode(&types.Stats{})
+	// If the container is either not running or restarting and requires no stream, return an empty stats.
+	if (!container.IsRunning() || container.IsRestarting()) && !config.Stream {
+		return json.NewEncoder(config.OutStream).Encode(&types.StatsJSON{
+			Name: container.Name,
+			ID:   container.ID})
 	}
 
 	outStream := config.OutStream
@@ -42,12 +46,16 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 	}
 
 	var preCPUStats types.CPUStats
+	var preRead time.Time
 	getStatJSON := func(v interface{}) *types.StatsJSON {
-		ss := v.(*types.StatsJSON)
+		ss := v.(types.StatsJSON)
+		ss.Name = container.Name
+		ss.ID = container.ID
 		ss.PreCPUStats = preCPUStats
-		// ss.MemoryStats.Limit = uint64(update.MemoryLimit)
+		ss.PreRead = preRead
 		preCPUStats = ss.CPUStats
-		return ss
+		preRead = ss.Read
+		return &ss
 	}
 
 	enc := json.NewEncoder(outStream)
@@ -65,7 +73,7 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 
 			var statsJSON interface{}
 			statsJSONPost120 := getStatJSON(v)
-			if apiVersion.LessThan("1.21") {
+			if versions.LessThan(apiVersion, "1.21") {
 				var (
 					rxBytes   uint64
 					rxPackets uint64
@@ -120,4 +128,29 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 			return nil
 		}
 	}
+}
+
+func (daemon *Daemon) subscribeToContainerStats(c *container.Container) chan interface{} {
+	return daemon.statsCollector.Collect(c)
+}
+
+func (daemon *Daemon) unsubscribeToContainerStats(c *container.Container, ch chan interface{}) {
+	daemon.statsCollector.Unsubscribe(c, ch)
+}
+
+// GetContainerStats collects all the stats published by a container
+func (daemon *Daemon) GetContainerStats(container *container.Container) (*types.StatsJSON, error) {
+	stats, err := daemon.stats(container)
+	if err != nil {
+		return nil, err
+	}
+
+	// We already have the network stats on Windows directly from HCS.
+	if !container.Config.NetworkDisabled && runtime.GOOS != "windows" {
+		if stats.Networks, err = daemon.getNetworkStats(container); err != nil {
+			return nil, err
+		}
+	}
+
+	return stats, nil
 }

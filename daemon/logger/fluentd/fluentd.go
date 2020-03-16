@@ -1,20 +1,23 @@
 // Package fluentd provides the log driver for forwarding server logs
 // to fluentd endpoints.
-package fluentd
+package fluentd // import "github.com/docker/docker/daemon/logger/fluentd"
 
 import (
-	"fmt"
 	"math"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/go-units"
+	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/urlutil"
+	units "github.com/docker/go-units"
 	"github.com/fluent/fluent-logger-golang/fluent"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type fluentd struct {
@@ -25,26 +28,34 @@ type fluentd struct {
 	extra         map[string]string
 }
 
+type location struct {
+	protocol string
+	host     string
+	port     int
+	path     string
+}
+
 const (
 	name = "fluentd"
 
+	defaultBufferLimit = 1024 * 1024
 	defaultHost        = "127.0.0.1"
 	defaultPort        = 24224
-	defaultBufferLimit = 1024 * 1024
-	defaultTagPrefix   = "docker"
+	defaultProtocol    = "tcp"
 
 	// logger tries to reconnect 2**32 - 1 times
 	// failed (and panic) after 204 years [ 1.5 ** (2**32 - 1) - 1 seconds]
-	defaultRetryWait              = 1000
-	defaultTimeout                = 3 * time.Second
-	defaultMaxRetries             = math.MaxInt32
-	defaultReconnectWaitIncreRate = 1.5
+	defaultMaxRetries = math.MaxInt32
+	defaultRetryWait  = 1000
 
-	addressKey      = "fluentd-address"
-	bufferLimitKey  = "fluentd-buffer-limit"
-	retryWaitKey    = "fluentd-retry-wait"
-	maxRetriesKey   = "fluentd-max-retries"
-	asyncConnectKey = "fluentd-async-connect"
+	addressKey            = "fluentd-address"
+	asyncKey              = "fluentd-async"
+	asyncConnectKey       = "fluentd-async-connect" // deprecated option (use fluent-async instead)
+	bufferLimitKey        = "fluentd-buffer-limit"
+	maxRetriesKey         = "fluentd-max-retries"
+	requestAckKey         = "fluentd-request-ack"
+	retryWaitKey          = "fluentd-retry-wait"
+	subSecondPrecisionKey = "fluentd-sub-second-precision"
 )
 
 func init() {
@@ -57,65 +68,25 @@ func init() {
 }
 
 // New creates a fluentd logger using the configuration passed in on
-// the context. Supported context configuration variables are
-// fluentd-address & fluentd-tag.
-func New(ctx logger.Context) (logger.Logger, error) {
-	host, port, err := parseAddress(ctx.Config[addressKey])
+// the context. The supported context configuration variable is
+// fluentd-address.
+func New(info logger.Info) (logger.Logger, error) {
+	fluentConfig, err := parseConfig(info.Config)
 	if err != nil {
-		return nil, err
+		return nil, errdefs.InvalidParameter(err)
 	}
 
-	tag, err := loggerutils.ParseLogTag(ctx, "docker.{{.ID}}")
+	tag, err := loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
 	if err != nil {
-		return nil, err
+		return nil, errdefs.InvalidParameter(err)
 	}
 
-	extra := ctx.ExtraAttributes(nil)
-
-	bufferLimit := defaultBufferLimit
-	if ctx.Config[bufferLimitKey] != "" {
-		bl64, err := units.RAMInBytes(ctx.Config[bufferLimitKey])
-		if err != nil {
-			return nil, err
-		}
-		bufferLimit = int(bl64)
+	extra, err := info.ExtraAttributes(nil)
+	if err != nil {
+		return nil, errdefs.InvalidParameter(err)
 	}
 
-	retryWait := defaultRetryWait
-	if ctx.Config[retryWaitKey] != "" {
-		rwd, err := time.ParseDuration(ctx.Config[retryWaitKey])
-		if err != nil {
-			return nil, err
-		}
-		retryWait = int(rwd.Seconds() * 1000)
-	}
-
-	maxRetries := defaultMaxRetries
-	if ctx.Config[maxRetriesKey] != "" {
-		mr64, err := strconv.ParseUint(ctx.Config[maxRetriesKey], 10, strconv.IntSize)
-		if err != nil {
-			return nil, err
-		}
-		maxRetries = int(mr64)
-	}
-
-	asyncConnect := false
-	if ctx.Config[asyncConnectKey] != "" {
-		if asyncConnect, err = strconv.ParseBool(ctx.Config[asyncConnectKey]); err != nil {
-			return nil, err
-		}
-	}
-
-	fluentConfig := fluent.Config{
-		FluentPort:   port,
-		FluentHost:   host,
-		BufferLimit:  bufferLimit,
-		RetryWait:    retryWait,
-		MaxRetry:     maxRetries,
-		AsyncConnect: asyncConnect,
-	}
-
-	logrus.WithField("container", ctx.ContainerID).WithField("config", fluentConfig).
+	logrus.WithField("container", info.ContainerID).WithField("config", fluentConfig).
 		Debug("logging driver fluentd configured")
 
 	log, err := fluent.New(fluentConfig)
@@ -124,8 +95,8 @@ func New(ctx logger.Context) (logger.Logger, error) {
 	}
 	return &fluentd{
 		tag:           tag,
-		containerID:   ctx.ContainerID,
-		containerName: ctx.ContainerName,
+		containerID:   info.ContainerID,
+		containerName: info.ContainerName,
 		writer:        log,
 		extra:         extra,
 	}, nil
@@ -141,9 +112,18 @@ func (f *fluentd) Log(msg *logger.Message) error {
 	for k, v := range f.extra {
 		data[k] = v
 	}
+	if msg.PLogMetaData != nil {
+		data["partial_message"] = "true"
+		data["partial_id"] = msg.PLogMetaData.ID
+		data["partial_ordinal"] = strconv.Itoa(msg.PLogMetaData.Ordinal)
+		data["partial_last"] = strconv.FormatBool(msg.PLogMetaData.Last)
+	}
+
+	ts := msg.Timestamp
+	logger.PutMessage(msg)
 	// fluent-logger-golang buffers logs from failures and disconnections,
 	// and these are transferred again automatically.
-	return f.writer.PostWithTime(f.tag, msg.Timestamp, data)
+	return f.writer.PostWithTime(f.tag, ts, data)
 }
 
 func (f *fluentd) Close() error {
@@ -154,48 +134,171 @@ func (f *fluentd) Name() string {
 	return name
 }
 
-// ValidateLogOpt looks for fluentd specific log options fluentd-address & fluentd-tag.
+// ValidateLogOpt looks for fluentd specific log option fluentd-address.
 func ValidateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
 		case "env":
-		case "fluentd-tag":
+		case "env-regex":
 		case "labels":
+		case "labels-regex":
 		case "tag":
+
 		case addressKey:
-		case bufferLimitKey:
-		case retryWaitKey:
-		case maxRetriesKey:
+		case asyncKey:
 		case asyncConnectKey:
+		case bufferLimitKey:
+		case maxRetriesKey:
+		case requestAckKey:
+		case retryWaitKey:
+		case subSecondPrecisionKey:
 			// Accepted
 		default:
-			return fmt.Errorf("unknown log opt '%s' for fluentd log driver", key)
+			return errors.Errorf("unknown log opt '%s' for fluentd log driver", key)
 		}
 	}
 
-	if _, _, err := parseAddress(cfg["fluentd-address"]); err != nil {
-		return err
-	}
-
-	return nil
+	_, err := parseConfig(cfg)
+	return err
 }
 
-func parseAddress(address string) (string, int, error) {
+func parseConfig(cfg map[string]string) (fluent.Config, error) {
+	var config fluent.Config
+
+	loc, err := parseAddress(cfg[addressKey])
+	if err != nil {
+		return config, err
+	}
+
+	bufferLimit := defaultBufferLimit
+	if cfg[bufferLimitKey] != "" {
+		bl64, err := units.RAMInBytes(cfg[bufferLimitKey])
+		if err != nil {
+			return config, err
+		}
+		bufferLimit = int(bl64)
+	}
+
+	retryWait := defaultRetryWait
+	if cfg[retryWaitKey] != "" {
+		rwd, err := time.ParseDuration(cfg[retryWaitKey])
+		if err != nil {
+			return config, err
+		}
+		retryWait = int(rwd.Seconds() * 1000)
+	}
+
+	maxRetries := defaultMaxRetries
+	if cfg[maxRetriesKey] != "" {
+		mr64, err := strconv.ParseUint(cfg[maxRetriesKey], 10, strconv.IntSize)
+		if err != nil {
+			return config, err
+		}
+		maxRetries = int(mr64)
+	}
+
+	if cfg[asyncKey] != "" && cfg[asyncConnectKey] != "" {
+		return config, errors.Errorf("conflicting options: cannot specify both '%s' and '%s", asyncKey, asyncConnectKey)
+	}
+
+	async := false
+	if cfg[asyncKey] != "" {
+		if async, err = strconv.ParseBool(cfg[asyncKey]); err != nil {
+			return config, err
+		}
+	}
+
+	// TODO fluentd-async-connect is deprecated in driver v1.4.0. Remove after two stable releases
+	asyncConnect := false
+	if cfg[asyncConnectKey] != "" {
+		if asyncConnect, err = strconv.ParseBool(cfg[asyncConnectKey]); err != nil {
+			return config, err
+		}
+	}
+
+	subSecondPrecision := false
+	if cfg[subSecondPrecisionKey] != "" {
+		if subSecondPrecision, err = strconv.ParseBool(cfg[subSecondPrecisionKey]); err != nil {
+			return config, err
+		}
+	}
+
+	requestAck := false
+	if cfg[requestAckKey] != "" {
+		if requestAck, err = strconv.ParseBool(cfg[requestAckKey]); err != nil {
+			return config, err
+		}
+	}
+
+	config = fluent.Config{
+		FluentPort:         loc.port,
+		FluentHost:         loc.host,
+		FluentNetwork:      loc.protocol,
+		FluentSocketPath:   loc.path,
+		BufferLimit:        bufferLimit,
+		RetryWait:          retryWait,
+		MaxRetry:           maxRetries,
+		Async:              async,
+		AsyncConnect:       asyncConnect,
+		SubSecondPrecision: subSecondPrecision,
+		RequestAck:         requestAck,
+	}
+
+	return config, nil
+}
+
+func parseAddress(address string) (*location, error) {
 	if address == "" {
-		return defaultHost, defaultPort, nil
+		return &location{
+			protocol: defaultProtocol,
+			host:     defaultHost,
+			port:     defaultPort,
+			path:     "",
+		}, nil
+	}
+
+	protocol := defaultProtocol
+	givenAddress := address
+	if urlutil.IsTransportURL(address) {
+		url, err := url.Parse(address)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
+		}
+		// unix and unixgram socket
+		if url.Scheme == "unix" || url.Scheme == "unixgram" {
+			return &location{
+				protocol: url.Scheme,
+				host:     "",
+				port:     0,
+				path:     url.Path,
+			}, nil
+		}
+		// tcp|udp
+		protocol = url.Scheme
+		address = url.Host
 	}
 
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		if !strings.Contains(err.Error(), "missing port in address") {
-			return "", 0, fmt.Errorf("invalid fluentd-address %s: %s", address, err)
+			return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
 		}
-		return host, defaultPort, nil
+		return &location{
+			protocol: protocol,
+			host:     host,
+			port:     defaultPort,
+			path:     "",
+		}, nil
 	}
 
 	portnum, err := strconv.Atoi(port)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid fluentd-address %s: %s", address, err)
+		return nil, errors.Wrapf(err, "invalid fluentd-address %s", givenAddress)
 	}
-	return host, portnum, nil
+	return &location{
+		protocol: protocol,
+		host:     host,
+		port:     portnum,
+		path:     "",
+	}, nil
 }

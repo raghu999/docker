@@ -1,10 +1,10 @@
-package httputils
+package httputils // import "github.com/docker/docker/api/server/httputils"
 
 import (
 	"io"
 
-	"github.com/docker/engine-api/types/container"
-	"github.com/docker/engine-api/types/network"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
 )
 
 // ContainerDecoder specifies how

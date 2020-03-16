@@ -2,100 +2,109 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/http"
-	"net/http/httptest"
-	"net/http/httputil"
-	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
-	"time"
+	"testing"
 
 	"github.com/docker/docker/api"
-	"github.com/docker/docker/pkg/integration/checker"
-	"github.com/go-check/check"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/testutil/request"
+	"gotest.tools/v3/assert"
 )
 
-func (s *DockerSuite) TestApiOptionsRoute(c *check.C) {
-	status, _, err := sockRequest("OPTIONS", "/", nil)
-	c.Assert(err, checker.IsNil)
-	c.Assert(status, checker.Equals, http.StatusOK)
+func (s *DockerSuite) TestAPIOptionsRoute(c *testing.T) {
+	resp, _, err := request.Do("/", request.Method(http.MethodOptions))
+	assert.NilError(c, err)
+	assert.Equal(c, resp.StatusCode, http.StatusOK)
 }
 
-func (s *DockerSuite) TestApiGetEnabledCors(c *check.C) {
-	res, body, err := sockRequestRaw("GET", "/version", nil, "")
-	c.Assert(err, checker.IsNil)
-	c.Assert(res.StatusCode, checker.Equals, http.StatusOK)
+func (s *DockerSuite) TestAPIGetEnabledCORS(c *testing.T) {
+	res, body, err := request.Get("/version")
+	assert.NilError(c, err)
+	assert.Equal(c, res.StatusCode, http.StatusOK)
 	body.Close()
 	// TODO: @runcom incomplete tests, why old integration tests had this headers
 	// and here none of the headers below are in the response?
 	//c.Log(res.Header)
-	//c.Assert(res.Header.Get("Access-Control-Allow-Origin"), check.Equals, "*")
-	//c.Assert(res.Header.Get("Access-Control-Allow-Headers"), check.Equals, "Origin, X-Requested-With, Content-Type, Accept, X-Registry-Auth")
+	//assert.Equal(c, res.Header.Get("Access-Control-Allow-Origin"), "*")
+	//assert.Equal(c, res.Header.Get("Access-Control-Allow-Headers"), "Origin, X-Requested-With, Content-Type, Accept, X-Registry-Auth")
 }
 
-func (s *DockerSuite) TestApiVersionStatusCode(c *check.C) {
-	conn, err := sockConn(time.Duration(10 * time.Second))
-	c.Assert(err, checker.IsNil)
-
-	client := httputil.NewClientConn(conn, nil)
-	defer client.Close()
-
-	req, err := http.NewRequest("GET", "/v999.0/version", nil)
-	c.Assert(err, checker.IsNil)
-	req.Header.Set("User-Agent", "Docker-Client/999.0 (os)")
-
-	res, err := client.Do(req)
-	c.Assert(res.StatusCode, checker.Equals, http.StatusBadRequest)
-}
-
-func (s *DockerSuite) TestApiClientVersionNewerThanServer(c *check.C) {
-	v := strings.Split(api.DefaultVersion.String(), ".")
+func (s *DockerSuite) TestAPIClientVersionOldNotSupported(c *testing.T) {
+	if testEnv.OSType != runtime.GOOS {
+		c.Skip("Daemon platform doesn't match test platform")
+	}
+	if api.MinVersion == api.DefaultVersion {
+		c.Skip("API MinVersion==DefaultVersion")
+	}
+	v := strings.Split(api.MinVersion, ".")
 	vMinInt, err := strconv.Atoi(v[1])
-	c.Assert(err, checker.IsNil)
-	vMinInt++
-	v[1] = strconv.Itoa(vMinInt)
-	version := strings.Join(v, ".")
-
-	status, body, err := sockRequest("GET", "/v"+version+"/version", nil)
-	c.Assert(err, checker.IsNil)
-	c.Assert(status, checker.Equals, http.StatusBadRequest)
-	expected := fmt.Sprintf("client is newer than server (client API version: %s, server API version: %s)", version, api.DefaultVersion)
-	c.Assert(strings.TrimSpace(string(body)), checker.Equals, expected)
-}
-
-func (s *DockerSuite) TestApiClientVersionOldNotSupported(c *check.C) {
-	v := strings.Split(api.MinVersion.String(), ".")
-	vMinInt, err := strconv.Atoi(v[1])
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 	vMinInt--
 	v[1] = strconv.Itoa(vMinInt)
 	version := strings.Join(v, ".")
 
-	status, body, err := sockRequest("GET", "/v"+version+"/version", nil)
-	c.Assert(err, checker.IsNil)
-	c.Assert(status, checker.Equals, http.StatusBadRequest)
+	resp, body, err := request.Get("/v" + version + "/version")
+	assert.NilError(c, err)
+	defer body.Close()
+	assert.Equal(c, resp.StatusCode, http.StatusBadRequest)
 	expected := fmt.Sprintf("client version %s is too old. Minimum supported API version is %s, please upgrade your client to a newer version", version, api.MinVersion)
-	c.Assert(strings.TrimSpace(string(body)), checker.Equals, expected)
+	content, err := ioutil.ReadAll(body)
+	assert.NilError(c, err)
+	assert.Equal(c, strings.TrimSpace(string(content)), expected)
 }
 
-func (s *DockerSuite) TestApiDockerApiVersion(c *check.C) {
-	var svrVersion string
-
-	server := httptest.NewServer(http.HandlerFunc(
-		func(w http.ResponseWriter, r *http.Request) {
-			url := r.URL.Path
-			svrVersion = url
-		}))
-	defer server.Close()
-
-	// Test using the env var first
-	cmd := exec.Command(dockerBinary, "-H="+server.URL[7:], "version")
-	cmd.Env = appendBaseEnv(false, "DOCKER_API_VERSION=xxx")
-	out, _, _ := runCommandWithOutput(cmd)
-
-	c.Assert(svrVersion, check.Equals, "/vxxx/version")
-
-	if !strings.Contains(out, "API version:  xxx") {
-		c.Fatalf("Out didn't have 'xxx' for the API version, had:\n%s", out)
+func (s *DockerSuite) TestAPIErrorJSON(c *testing.T) {
+	httpResp, body, err := request.Post("/containers/create", request.JSONBody(struct{}{}))
+	assert.NilError(c, err)
+	if versions.LessThan(testEnv.DaemonAPIVersion(), "1.32") {
+		assert.Equal(c, httpResp.StatusCode, http.StatusInternalServerError)
+	} else {
+		assert.Equal(c, httpResp.StatusCode, http.StatusBadRequest)
 	}
+	assert.Assert(c, strings.Contains(httpResp.Header.Get("Content-Type"), "application/json"))
+	b, err := request.ReadBody(body)
+	assert.NilError(c, err)
+	assert.Equal(c, getErrorMessage(c, b), "Config cannot be empty in order to create a container")
+}
+
+func (s *DockerSuite) TestAPIErrorPlainText(c *testing.T) {
+	// Windows requires API 1.25 or later. This test is validating a behaviour which was present
+	// in v1.23, but changed in 1.24, hence not applicable on Windows. See apiVersionSupportsJSONErrors
+	testRequires(c, DaemonIsLinux)
+	httpResp, body, err := request.Post("/v1.23/containers/create", request.JSONBody(struct{}{}))
+	assert.NilError(c, err)
+	if versions.LessThan(testEnv.DaemonAPIVersion(), "1.32") {
+		assert.Equal(c, httpResp.StatusCode, http.StatusInternalServerError)
+	} else {
+		assert.Equal(c, httpResp.StatusCode, http.StatusBadRequest)
+	}
+	assert.Assert(c, strings.Contains(httpResp.Header.Get("Content-Type"), "text/plain"))
+	b, err := request.ReadBody(body)
+	assert.NilError(c, err)
+	assert.Equal(c, strings.TrimSpace(string(b)), "Config cannot be empty in order to create a container")
+}
+
+func (s *DockerSuite) TestAPIErrorNotFoundJSON(c *testing.T) {
+	// 404 is a different code path to normal errors, so test separately
+	httpResp, body, err := request.Get("/notfound", request.JSON)
+	assert.NilError(c, err)
+	assert.Equal(c, httpResp.StatusCode, http.StatusNotFound)
+	assert.Assert(c, strings.Contains(httpResp.Header.Get("Content-Type"), "application/json"))
+	b, err := request.ReadBody(body)
+	assert.NilError(c, err)
+	assert.Equal(c, getErrorMessage(c, b), "page not found")
+}
+
+func (s *DockerSuite) TestAPIErrorNotFoundPlainText(c *testing.T) {
+	httpResp, body, err := request.Get("/v1.23/notfound", request.JSON)
+	assert.NilError(c, err)
+	assert.Equal(c, httpResp.StatusCode, http.StatusNotFound)
+	assert.Assert(c, strings.Contains(httpResp.Header.Get("Content-Type"), "text/plain"))
+	b, err := request.ReadBody(body)
+	assert.NilError(c, err)
+	assert.Equal(c, strings.TrimSpace(string(b)), "page not found")
 }

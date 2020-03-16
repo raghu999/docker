@@ -1,6 +1,6 @@
 <!--
 Please make sure you've read and understood our contributing guidelines;
-https://github.com/docker/docker/blob/master/CONTRIBUTING.md
+https://github.com/moby/moby/blob/master/CONTRIBUTING.md
 
 ** Make sure all your commits include a signature generated with `git commit -s` **
 
@@ -18,6 +18,13 @@ Please provide the following information:
 **- How I did it**
 
 **- How to verify it**
+
+**- Description for the changelog**
+<!--
+Write a short (one line) summary that describes the changes in this
+pull request for inclusion in the changelog:
+-->
+
 
 **- A picture of a cute animal (not mandatory but encouraged)**
 

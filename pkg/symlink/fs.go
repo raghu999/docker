@@ -4,7 +4,7 @@
 
 // This code is a modified version of path/filepath/symlink.go from the Go standard library.
 
-package symlink
+package symlink // import "github.com/docker/docker/pkg/symlink"
 
 import (
 	"bytes"
@@ -12,8 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/docker/docker/pkg/system"
 )
 
 // FollowSymlinkInScope is a wrapper around evalSymlinksInScope that returns an
@@ -40,7 +38,7 @@ func FollowSymlinkInScope(path, root string) (string, error) {
 //
 // Example:
 //   If /foo/bar -> /outside,
-//   FollowSymlinkInScope("/foo/bar", "/foo") == "/foo/outside" instead of "/oustide"
+//   FollowSymlinkInScope("/foo/bar", "/foo") == "/foo/outside" instead of "/outside"
 //
 // IMPORTANT: it is the caller's responsibility to call evalSymlinksInScope *after* relevant symlinks
 // are created and not to create subsequently, additional symlinks that could potentially make a
@@ -95,8 +93,8 @@ func evalSymlinksInScope(path, root string) (string, error) {
 		// root gets prepended and we Clean again (to remove any trailing slash
 		// if the first Clean gave us just "/")
 		cleanP := filepath.Clean(string(filepath.Separator) + b.String() + p)
-		if cleanP == string(filepath.Separator) {
-			// never Lstat "/" itself
+		if isDriveOrRoot(cleanP) {
+			// never Lstat "/" itself, or drive letters on Windows
 			b.Reset()
 			continue
 		}
@@ -113,7 +111,8 @@ func evalSymlinksInScope(path, root string) (string, error) {
 			return "", err
 		}
 		if fi.Mode()&os.ModeSymlink == 0 {
-			b.WriteString(p + string(filepath.Separator))
+			b.WriteString(p)
+			b.WriteRune(filepath.Separator)
 			continue
 		}
 
@@ -122,7 +121,7 @@ func evalSymlinksInScope(path, root string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if system.IsAbs(dest) {
+		if isAbs(dest) {
 			b.Reset()
 		}
 		path = dest + string(filepath.Separator) + path

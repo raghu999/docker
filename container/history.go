@@ -1,4 +1,4 @@
-package container
+package container // import "github.com/docker/docker/container"
 
 import "sort"
 
@@ -22,11 +22,6 @@ func (history *History) Less(i, j int) bool {
 func (history *History) Swap(i, j int) {
 	containers := *history
 	containers[i], containers[j] = containers[j], containers[i]
-}
-
-// Add the given container to history.
-func (history *History) Add(container *Container) {
-	*history = append(*history, container)
 }
 
 // sort orders the history by creation date in descendant order.

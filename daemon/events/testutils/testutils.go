@@ -1,4 +1,4 @@
-package eventstestutils
+package testutils // import "github.com/docker/docker/daemon/events/testutils"
 
 import (
 	"fmt"
@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/engine-api/types/events"
-	timetypes "github.com/docker/engine-api/types/time"
+	"github.com/docker/docker/api/types/events"
+	timetypes "github.com/docker/docker/api/types/time"
 )
 
 var (
@@ -62,10 +62,9 @@ func Scan(text string) (*events.Message, error) {
 		attrs[kv[0]] = kv[1]
 	}
 
-	tu := time.Unix(t, tn)
 	return &events.Message{
 		Time:     t,
-		TimeNano: tu.UnixNano(),
+		TimeNano: time.Unix(t, tn).UnixNano(),
 		Type:     md["eventType"],
 		Action:   md["action"],
 		Actor: events.Actor{

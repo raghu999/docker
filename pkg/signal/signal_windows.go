@@ -1,12 +1,10 @@
-// +build windows
-
-package signal
+package signal // import "github.com/docker/docker/pkg/signal"
 
 import (
 	"syscall"
 )
 
-// Signals used in api/client (no windows equivalent, use
+// Signals used in cli/command (no windows equivalent, use
 // invalid signals so they don't get handled)
 const (
 	SIGCHLD  = syscall.Signal(0xff)

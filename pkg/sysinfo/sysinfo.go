@@ -1,4 +1,4 @@
-package sysinfo
+package sysinfo // import "github.com/docker/docker/pkg/sysinfo"
 
 import "github.com/docker/docker/pkg/parsers"
 
@@ -15,6 +15,9 @@ type SysInfo struct {
 	cgroupBlkioInfo
 	cgroupCpusetInfo
 	cgroupPids
+
+	// Whether the kernel supports cgroup namespaces or not
+	CgroupNamespaces bool
 
 	// Whether IPv4 forwarding is supported or not, if this was disabled, networking will not work
 	IPv4ForwardingDisabled bool
@@ -47,6 +50,9 @@ type cgroupMemInfo struct {
 
 	// Whether kernel memory limit is supported or not
 	KernelMemory bool
+
+	// Whether kernel memory TCP limit is supported or not
+	KernelMemoryTCP bool
 }
 
 type cgroupCPUInfo struct {
@@ -58,6 +64,12 @@ type cgroupCPUInfo struct {
 
 	// Whether CPU CFS(Completely Fair Scheduler) quota is supported or not
 	CPUCfsQuota bool
+
+	// Whether CPU real-time period is supported or not
+	CPURealtimePeriod bool
+
+	// Whether CPU real-time runtime is supported or not
+	CPURealtimeRuntime bool
 }
 
 type cgroupBlkioInfo struct {
@@ -111,11 +123,19 @@ func (c cgroupCpusetInfo) IsCpusetMemsAvailable(provided string) (bool, error) {
 }
 
 func isCpusetListAvailable(provided, available string) (bool, error) {
-	parsedProvided, err := parsers.ParseUintList(provided)
+	parsedAvailable, err := parsers.ParseUintList(available)
 	if err != nil {
 		return false, err
 	}
-	parsedAvailable, err := parsers.ParseUintList(available)
+	// 8192 is the normal maximum number of CPUs in Linux, so accept numbers up to this
+	// or more if we actually have more CPUs.
+	max := 8192
+	for m := range parsedAvailable {
+		if m > max {
+			max = m
+		}
+	}
+	parsedProvided, err := parsers.ParseUintListMaximum(provided, max)
 	if err != nil {
 		return false, err
 	}

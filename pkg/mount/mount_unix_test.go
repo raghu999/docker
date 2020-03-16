@@ -1,6 +1,6 @@
 // +build !windows
 
-package mount
+package mount // import "github.com/docker/docker/pkg/mount"
 
 import (
 	"os"
@@ -25,6 +25,10 @@ func TestMountOptionsParsing(t *testing.T) {
 }
 
 func TestMounted(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root required")
+	}
+
 	tmp := path.Join(os.TempDir(), "mount-tests")
 	if err := os.MkdirAll(tmp, 0777); err != nil {
 		t.Fatal(err)
@@ -76,6 +80,10 @@ func TestMounted(t *testing.T) {
 }
 
 func TestMountReadonly(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root required")
+	}
+
 	tmp := path.Join(os.TempDir(), "mount-tests")
 	if err := os.MkdirAll(tmp, 0777); err != nil {
 		t.Fatal(err)
@@ -114,14 +122,14 @@ func TestMountReadonly(t *testing.T) {
 		}
 	}()
 
-	f, err = os.OpenFile(targetPath, os.O_RDWR, 0777)
+	_, err = os.OpenFile(targetPath, os.O_RDWR, 0777)
 	if err == nil {
 		t.Fatal("Should not be able to open a ro file as rw")
 	}
 }
 
 func TestGetMounts(t *testing.T) {
-	mounts, err := GetMounts()
+	mounts, err := GetMounts(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,5 +143,28 @@ func TestGetMounts(t *testing.T) {
 
 	if !root {
 		t.Fatal("/ should be mounted at least")
+	}
+}
+
+func TestMergeTmpfsOptions(t *testing.T) {
+	options := []string{"noatime", "ro", "size=10k", "defaults", "atime", "defaults", "rw", "rprivate", "size=1024k", "slave"}
+	expected := []string{"atime", "rw", "size=1024k", "slave"}
+	merged, err := MergeTmpfsOptions(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expected) != len(merged) {
+		t.Fatalf("Expected %s got %s", expected, merged)
+	}
+	for index := range merged {
+		if merged[index] != expected[index] {
+			t.Fatalf("Expected %s for the %dth option, got %s", expected, index, merged)
+		}
+	}
+
+	options = []string{"noatime", "ro", "size=10k", "atime", "rw", "rprivate", "size=1024k", "slave", "size"}
+	_, err = MergeTmpfsOptions(options)
+	if err == nil {
+		t.Fatal("Expected error got nil")
 	}
 }

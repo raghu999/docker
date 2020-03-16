@@ -1,10 +1,13 @@
-package opts
+package opts // import "github.com/docker/docker/opts"
 
 import (
 	"fmt"
 	"net"
+	"path"
 	"regexp"
 	"strings"
+
+	units "github.com/docker/go-units"
 )
 
 var (
@@ -33,7 +36,10 @@ func NewListOptsRef(values *[]string, validator ValidatorFctType) *ListOpts {
 }
 
 func (opts *ListOpts) String() string {
-	return fmt.Sprintf("%v", []string((*opts.values)))
+	if len(*opts.values) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%v", *opts.values)
 }
 
 // Set validates if needed the input value and adds it to the
@@ -46,7 +52,7 @@ func (opts *ListOpts) Set(value string) error {
 		}
 		value = v
 	}
-	(*opts.values) = append((*opts.values), value)
+	*opts.values = append(*opts.values, value)
 	return nil
 }
 
@@ -54,7 +60,7 @@ func (opts *ListOpts) Set(value string) error {
 func (opts *ListOpts) Delete(key string) {
 	for i, k := range *opts.values {
 		if k == key {
-			(*opts.values) = append((*opts.values)[:i], (*opts.values)[i+1:]...)
+			*opts.values = append((*opts.values)[:i], (*opts.values)[i+1:]...)
 			return
 		}
 	}
@@ -72,7 +78,7 @@ func (opts *ListOpts) GetMap() map[string]struct{} {
 
 // GetAll returns the values of slice.
 func (opts *ListOpts) GetAll() []string {
-	return (*opts.values)
+	return *opts.values
 }
 
 // GetAllOrEmpty returns the values of the slice
@@ -97,7 +103,18 @@ func (opts *ListOpts) Get(key string) bool {
 
 // Len returns the amount of element in the slice.
 func (opts *ListOpts) Len() int {
-	return len((*opts.values))
+	return len(*opts.values)
+}
+
+// Type returns a string name for this Option type
+func (opts *ListOpts) Type() string {
+	return "list"
+}
+
+// WithValidator returns the ListOpts with validator set.
+func (opts *ListOpts) WithValidator(validator ValidatorFctType) *ListOpts {
+	opts.validator = validator
+	return opts
 }
 
 // NamedOption is an interface that list and map options
@@ -129,7 +146,7 @@ func (o *NamedListOpts) Name() string {
 	return o.name
 }
 
-//MapOpts holds a map of values and a validation function.
+// MapOpts holds a map of values and a validation function.
 type MapOpts struct {
 	values    map[string]string
 	validator ValidatorFctType
@@ -160,7 +177,12 @@ func (opts *MapOpts) GetAll() map[string]string {
 }
 
 func (opts *MapOpts) String() string {
-	return fmt.Sprintf("%v", map[string]string((opts.values)))
+	return fmt.Sprintf("%v", opts.values)
+}
+
+// Type returns a string name for this Option type
+func (opts *MapOpts) Type() string {
+	return "map"
 }
 
 // NewMapOpts creates a new MapOpts with the specified map of values and a validator.
@@ -232,11 +254,95 @@ func validateDomain(val string) (string, error) {
 	return "", fmt.Errorf("%s is not a valid domain", val)
 }
 
-// ValidateLabel validates that the specified string is a valid label, and returns it.
+// ValidateLabel validates that the specified string is a valid label,
+// it does not use the reserved namespaces com.docker.*, io.docker.*, org.dockerproject.*
+// and returns it.
 // Labels are in the form on key=value.
 func ValidateLabel(val string) (string, error) {
 	if strings.Count(val, "=") < 1 {
 		return "", fmt.Errorf("bad attribute format: %s", val)
 	}
+
+	lowered := strings.ToLower(val)
+	if strings.HasPrefix(lowered, "com.docker.") || strings.HasPrefix(lowered, "io.docker.") ||
+		strings.HasPrefix(lowered, "org.dockerproject.") {
+		return "", fmt.Errorf(
+			"label %s is not allowed: the namespaces com.docker.*, io.docker.*, and org.dockerproject.* are reserved for internal use",
+			val)
+	}
+
 	return val, nil
+}
+
+// ValidateSingleGenericResource validates that a single entry in the
+// generic resource list is valid.
+// i.e 'GPU=UID1' is valid however 'GPU:UID1' or 'UID1' isn't
+func ValidateSingleGenericResource(val string) (string, error) {
+	if strings.Count(val, "=") < 1 {
+		return "", fmt.Errorf("invalid node-generic-resource format `%s` expected `name=value`", val)
+	}
+	return val, nil
+}
+
+// ParseLink parses and validates the specified string as a link format (name:alias)
+func ParseLink(val string) (string, string, error) {
+	if val == "" {
+		return "", "", fmt.Errorf("empty string specified for links")
+	}
+	arr := strings.Split(val, ":")
+	if len(arr) > 2 {
+		return "", "", fmt.Errorf("bad format for links: %s", val)
+	}
+	if len(arr) == 1 {
+		return val, val, nil
+	}
+	// This is kept because we can actually get a HostConfig with links
+	// from an already created container and the format is not `foo:bar`
+	// but `/foo:/c1/bar`
+	if strings.HasPrefix(arr[0], "/") {
+		_, alias := path.Split(arr[1])
+		return arr[0][1:], alias, nil
+	}
+	return arr[0], arr[1], nil
+}
+
+// MemBytes is a type for human readable memory bytes (like 128M, 2g, etc)
+type MemBytes int64
+
+// String returns the string format of the human readable memory bytes
+func (m *MemBytes) String() string {
+	// NOTE: In spf13/pflag/flag.go, "0" is considered as "zero value" while "0 B" is not.
+	// We return "0" in case value is 0 here so that the default value is hidden.
+	// (Sometimes "default 0 B" is actually misleading)
+	if m.Value() != 0 {
+		return units.BytesSize(float64(m.Value()))
+	}
+	return "0"
+}
+
+// Set sets the value of the MemBytes by passing a string
+func (m *MemBytes) Set(value string) error {
+	val, err := units.RAMInBytes(value)
+	*m = MemBytes(val)
+	return err
+}
+
+// Type returns the type
+func (m *MemBytes) Type() string {
+	return "bytes"
+}
+
+// Value returns the value in int64
+func (m *MemBytes) Value() int64 {
+	return int64(*m)
+}
+
+// UnmarshalJSON is the customized unmarshaler for MemBytes
+func (m *MemBytes) UnmarshalJSON(s []byte) error {
+	if len(s) <= 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return fmt.Errorf("invalid size: %q", s)
+	}
+	val, err := units.RAMInBytes(string(s[1 : len(s)-1]))
+	*m = MemBytes(val)
+	return err
 }

@@ -1,25 +1,55 @@
-// +build linux
-
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/engine-api/types/container"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func toContainerdResources(resources container.Resources) libcontainerd.Resources {
-	var r libcontainerd.Resources
-	r.BlkioWeight = uint32(resources.BlkioWeight)
-	r.CpuShares = uint32(resources.CPUShares)
-	r.CpuPeriod = uint32(resources.CPUPeriod)
-	r.CpuQuota = uint32(resources.CPUQuota)
-	r.CpusetCpus = resources.CpusetCpus
-	r.CpusetMems = resources.CpusetMems
-	r.MemoryLimit = uint32(resources.Memory)
-	if resources.MemorySwap > 0 {
-		r.MemorySwap = uint32(resources.MemorySwap)
+func toContainerdResources(resources container.Resources) *libcontainerdtypes.Resources {
+	var r libcontainerdtypes.Resources
+
+	r.BlockIO = &specs.LinuxBlockIO{
+		Weight: &resources.BlkioWeight,
 	}
-	r.MemoryReservation = uint32(resources.MemoryReservation)
-	r.KernelMemoryLimit = uint32(resources.KernelMemory)
-	return r
+
+	shares := uint64(resources.CPUShares)
+	r.CPU = &specs.LinuxCPU{
+		Shares: &shares,
+		Cpus:   resources.CpusetCpus,
+		Mems:   resources.CpusetMems,
+	}
+
+	var (
+		period uint64
+		quota  int64
+	)
+	if resources.NanoCPUs != 0 {
+		period = uint64(100 * time.Millisecond / time.Microsecond)
+		quota = resources.NanoCPUs * int64(period) / 1e9
+	}
+	if quota == 0 && resources.CPUQuota != 0 {
+		quota = resources.CPUQuota
+	}
+	if period == 0 && resources.CPUPeriod != 0 {
+		period = uint64(resources.CPUPeriod)
+	}
+
+	r.CPU.Period = &period
+	r.CPU.Quota = &quota
+
+	r.Memory = &specs.LinuxMemory{
+		Limit:       &resources.Memory,
+		Reservation: &resources.MemoryReservation,
+		Kernel:      &resources.KernelMemory,
+	}
+
+	if resources.MemorySwap > 0 {
+		r.Memory.Swap = &resources.MemorySwap
+	}
+
+	r.Pids = getPidsLimit(resources)
+	return &r
 }

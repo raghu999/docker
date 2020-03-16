@@ -1,7 +1,12 @@
-package middleware
+package middleware // import "github.com/docker/docker/api/server/middleware"
 
-import "github.com/docker/docker/api/server/httputils"
+import (
+	"context"
+	"net/http"
+)
 
-// Middleware is an adapter to allow the use of ordinary functions as Docker API filters.
-// Any function that has the appropriate signature can be registered as a middleware.
-type Middleware func(handler httputils.APIFunc) httputils.APIFunc
+// Middleware is an interface to allow the use of ordinary functions as Docker API filters.
+// Any struct that has the appropriate signature can be registered as a middleware.
+type Middleware interface {
+	WrapHandler(func(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error) func(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error
+}

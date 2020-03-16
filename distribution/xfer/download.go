@@ -1,18 +1,21 @@
-package xfer
+package xfer // import "github.com/docker/docker/distribution/xfer"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/distribution"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
-	"golang.org/x/net/context"
+	"github.com/docker/docker/pkg/system"
+	"github.com/sirupsen/logrus"
 )
 
 const maxDownloadAttempts = 5
@@ -21,15 +24,36 @@ const maxDownloadAttempts = 5
 // registers and downloads those, taking into account dependencies between
 // layers.
 type LayerDownloadManager struct {
-	layerStore layer.Store
-	tm         TransferManager
+	layerStores         map[string]layer.Store
+	tm                  TransferManager
+	waitDuration        time.Duration
+	maxDownloadAttempts int
+}
+
+// SetConcurrency sets the max concurrent downloads for each pull
+func (ldm *LayerDownloadManager) SetConcurrency(concurrency int) {
+	ldm.tm.SetConcurrency(concurrency)
 }
 
 // NewLayerDownloadManager returns a new LayerDownloadManager.
-func NewLayerDownloadManager(layerStore layer.Store, concurrencyLimit int) *LayerDownloadManager {
-	return &LayerDownloadManager{
-		layerStore: layerStore,
-		tm:         NewTransferManager(concurrencyLimit),
+func NewLayerDownloadManager(layerStores map[string]layer.Store, concurrencyLimit int, options ...func(*LayerDownloadManager)) *LayerDownloadManager {
+	manager := LayerDownloadManager{
+		layerStores:         layerStores,
+		tm:                  NewTransferManager(concurrencyLimit),
+		waitDuration:        time.Second,
+		maxDownloadAttempts: maxDownloadAttempts,
+	}
+	for _, option := range options {
+		option(&manager)
+	}
+	return &manager
+}
+
+// WithMaxDownloadAttempts configures the maximum number of download
+// attempts for a download manager.
+func WithMaxDownloadAttempts(max int) func(*LayerDownloadManager) {
+	return func(dlm *LayerDownloadManager) {
+		dlm.maxDownloadAttempts = max
 	}
 }
 
@@ -81,8 +105,8 @@ type DownloadDescriptorWithRegistered interface {
 // the layer store, and the key is not used by an in-progress download, the
 // Download method is called to get the layer tar data. Layers are then
 // registered in the appropriate order.  The caller must call the returned
-// release function once it is is done with the returned RootFS object.
-func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS image.RootFS, layers []DownloadDescriptor, progressOutput progress.Output) (image.RootFS, func(), error) {
+// release function once it is done with the returned RootFS object.
+func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS image.RootFS, os string, layers []DownloadDescriptor, progressOutput progress.Output) (image.RootFS, func(), error) {
 	var (
 		topLayer       layer.Layer
 		topDownload    *downloadTransfer
@@ -91,6 +115,15 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 		transferKey    = ""
 		downloadsByKey = make(map[string]*downloadTransfer)
 	)
+
+	// Assume that the operating system is the host OS if blank, and validate it
+	// to ensure we don't cause a panic by an invalid index into the layerstores.
+	if os == "" {
+		os = runtime.GOOS
+	}
+	if !system.IsOSSupported(os) {
+		return image.RootFS{}, nil, system.ErrNotSupportedOperatingSystem
+	}
 
 	rootFS := initialRootFS
 	for _, descriptor := range layers {
@@ -103,17 +136,22 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 			if err == nil {
 				getRootFS := rootFS
 				getRootFS.Append(diffID)
-				l, err := ldm.layerStore.Get(getRootFS.ChainID())
+				l, err := ldm.layerStores[os].Get(getRootFS.ChainID())
 				if err == nil {
 					// Layer already exists.
 					logrus.Debugf("Layer already exists: %s", descriptor.ID())
 					progress.Update(progressOutput, descriptor.ID(), "Already exists")
 					if topLayer != nil {
-						layer.ReleaseAndLog(ldm.layerStore, topLayer)
+						layer.ReleaseAndLog(ldm.layerStores[os], topLayer)
 					}
 					topLayer = l
 					missingLayer = false
 					rootFS.Append(diffID)
+					// Register this repository as a source of this layer.
+					withRegistered, hasRegistered := descriptor.(DownloadDescriptorWithRegistered)
+					if hasRegistered { // As layerstore may set the driver
+						withRegistered.Registered(diffID)
+					}
 					continue
 				}
 			}
@@ -123,7 +161,7 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 		// the stack? If so, avoid downloading it more than once.
 		var topDownloadUncasted Transfer
 		if existingDownload, ok := downloadsByKey[key]; ok {
-			xferFunc := ldm.makeDownloadFuncFromDownload(descriptor, existingDownload, topDownload)
+			xferFunc := ldm.makeDownloadFuncFromDownload(descriptor, existingDownload, topDownload, os)
 			defer topDownload.Transfer.Release(watcher)
 			topDownloadUncasted, watcher = ldm.tm.Transfer(transferKey, xferFunc, progressOutput)
 			topDownload = topDownloadUncasted.(*downloadTransfer)
@@ -135,10 +173,10 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 
 		var xferFunc DoFunc
 		if topDownload != nil {
-			xferFunc = ldm.makeDownloadFunc(descriptor, "", topDownload)
+			xferFunc = ldm.makeDownloadFunc(descriptor, "", topDownload, os)
 			defer topDownload.Transfer.Release(watcher)
 		} else {
-			xferFunc = ldm.makeDownloadFunc(descriptor, rootFS.ChainID(), nil)
+			xferFunc = ldm.makeDownloadFunc(descriptor, rootFS.ChainID(), nil, os)
 		}
 		topDownloadUncasted, watcher = ldm.tm.Transfer(transferKey, xferFunc, progressOutput)
 		topDownload = topDownloadUncasted.(*downloadTransfer)
@@ -148,7 +186,7 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 	if topDownload == nil {
 		return rootFS, func() {
 			if topLayer != nil {
-				layer.ReleaseAndLog(ldm.layerStore, topLayer)
+				layer.ReleaseAndLog(ldm.layerStores[os], topLayer)
 			}
 		}, nil
 	}
@@ -159,7 +197,7 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 
 	defer func() {
 		if topLayer != nil {
-			layer.ReleaseAndLog(ldm.layerStore, topLayer)
+			layer.ReleaseAndLog(ldm.layerStores[os], topLayer)
 		}
 	}()
 
@@ -195,11 +233,11 @@ func (ldm *LayerDownloadManager) Download(ctx context.Context, initialRootFS ima
 // complete before the registration step, and registers the downloaded data
 // on top of parentDownload's resulting layer. Otherwise, it registers the
 // layer on top of the ChainID given by parentLayer.
-func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor, parentLayer layer.ChainID, parentDownload *downloadTransfer) DoFunc {
+func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor, parentLayer layer.ChainID, parentDownload *downloadTransfer, os string) DoFunc {
 	return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
 		d := &downloadTransfer{
 			Transfer:   NewTransfer(),
-			layerStore: ldm.layerStore,
+			layerStore: ldm.layerStores[os],
 		}
 
 		go func() {
@@ -255,15 +293,15 @@ func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor,
 				}
 
 				retries++
-				if _, isDNR := err.(DoNotRetry); isDNR || retries == maxDownloadAttempts {
-					logrus.Errorf("Download failed: %v", err)
+				if _, isDNR := err.(DoNotRetry); isDNR || retries > ldm.maxDownloadAttempts {
+					logrus.Errorf("Download failed after %d attempts: %v", retries, err)
 					d.err = err
 					return
 				}
 
-				logrus.Errorf("Download failed, retrying: %v", err)
+				logrus.Infof("Download failed, retrying (%d/%d): %v", retries, ldm.maxDownloadAttempts, err)
 				delay := retries * 5
-				ticker := time.NewTicker(time.Second)
+				ticker := time.NewTicker(ldm.waitDuration)
 
 			selectLoop:
 				for {
@@ -313,7 +351,15 @@ func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor,
 				return
 			}
 
-			d.layer, err = d.layerStore.Register(inflatedLayerData, parentLayer)
+			var src distribution.Descriptor
+			if fs, ok := descriptor.(distribution.Describable); ok {
+				src = fs.Descriptor()
+			}
+			if ds, ok := d.layerStore.(layer.DescribableStore); ok {
+				d.layer, err = ds.RegisterWithDescriptor(inflatedLayerData, parentLayer, src)
+			} else {
+				d.layer, err = d.layerStore.Register(inflatedLayerData, parentLayer)
+			}
 			if err != nil {
 				select {
 				case <-d.Transfer.Context().Done():
@@ -351,11 +397,11 @@ func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor,
 // parentDownload. This function does not log progress output because it would
 // interfere with the progress reporting for sourceDownload, which has the same
 // Key.
-func (ldm *LayerDownloadManager) makeDownloadFuncFromDownload(descriptor DownloadDescriptor, sourceDownload *downloadTransfer, parentDownload *downloadTransfer) DoFunc {
+func (ldm *LayerDownloadManager) makeDownloadFuncFromDownload(descriptor DownloadDescriptor, sourceDownload *downloadTransfer, parentDownload *downloadTransfer, os string) DoFunc {
 	return func(progressChan chan<- progress.Progress, start <-chan struct{}, inactive chan<- struct{}) Transfer {
 		d := &downloadTransfer{
 			Transfer:   NewTransfer(),
-			layerStore: ldm.layerStore,
+			layerStore: ldm.layerStores[os],
 		}
 
 		go func() {
@@ -404,7 +450,15 @@ func (ldm *LayerDownloadManager) makeDownloadFuncFromDownload(descriptor Downloa
 			}
 			defer layerReader.Close()
 
-			d.layer, err = d.layerStore.Register(layerReader, parentLayer)
+			var src distribution.Descriptor
+			if fs, ok := l.(distribution.Describable); ok {
+				src = fs.Descriptor()
+			}
+			if ds, ok := d.layerStore.(layer.DescribableStore); ok {
+				d.layer, err = ds.RegisterWithDescriptor(layerReader, parentLayer, src)
+			} else {
+				d.layer, err = d.layerStore.Register(layerReader, parentLayer)
+			}
 			if err != nil {
 				d.err = fmt.Errorf("failed to register layer: %v", err)
 				return
